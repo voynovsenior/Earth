@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Earth 3D — live sun</title>
+<style>
+:root { color-scheme: dark; }
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; color: #e8eefc; }
+#app, #app canvas { position: fixed; inset: 0; touch-action: none; }
+#ui { position: fixed; inset: 0; pointer-events: none; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+#ui > * { pointer-events: auto; }
+#top { position: absolute; top: 12px; left: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#clock { font: 600 15px ui-monospace, monospace; background: #0b1220cc; padding: 8px 12px; border-radius: 10px; }
+button { font: inherit; color: inherit; background: #0b1220cc; border: 1px solid #2a3a5c; border-radius: 10px; padding: 8px 12px; cursor: pointer; }
+button:hover { background: #1c2f57; }
+#list { position: absolute; display: flex; gap: 6px; background: #0b1220cc; padding: 8px; border-radius: 12px; left: 12px; right: 12px; bottom: 12px; overflow-x: auto; }
+#list button { white-space: nowrap; padding: 6px 10px; font-size: 14px; }
+#info { position: absolute; left: 12px; right: 12px; bottom: 70px; background: #0b1220e6; border-radius: 12px; padding: 12px 14px; font-size: 14px; line-height: 1.5; }
+#info[hidden] { display: none; }
+#info h2 { margin: 0 0 4px; font-size: 18px; }
+.label { color: #fff; font-size: 13px; text-shadow: 0 0 4px #000, 0 0 8px #000; padding: 2px 6px; cursor: pointer; transform: translateY(-14px); white-space: nowrap; transition: opacity .2s; }
+@media (min-width: 720px) {
+  #list { left: auto; right: 12px; top: 12px; bottom: auto; flex-direction: column; width: 170px; overflow: auto; max-height: 70vh; }
+  #info { left: 12px; right: auto; bottom: 12px; width: 280px; }
+}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="ui">
+  <div id="top">
+    <div id="clock">--:--:-- UTC</div>
+    <button id="toggle">☀ Реальное освещение</button>
+  </div>
+  <div id="info" hidden></div>
+  <div id="list"></div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+/* ================= ДАННЫЕ ГОРОДОВ ================= */
+const CITIES = [
+  { name: 'Москва', country: 'Россия', lat: 55.75, lng: 37.62, population: 12600000 },
+  { name: 'Нью-Йорк', country: 'США', lat: 40.71, lng: -74.0, population: 8300000 },
+  { name: 'Токио', country: 'Япония', lat: 35.68, lng: 139.69, population: 14000000 },
+  { name: 'Лондон', country: 'Великобритания', lat: 51.51, lng: -0.13, population: 9000000 },
+  { name: 'Сидней', country: 'Австралия', lat: -33.87, lng: 151.21, population: 5300000 },
+  { name: 'Париж', country: 'Франция', lat: 48.86, lng: 2.35, population: 2100000 },
+  { name: 'Каир', country: 'Египет', lat: 30.04, lng: 31.24, population: 10000000 },
+  { name: 'Дели', country: 'Индия', lat: 28.61, lng: 77.21, population: 32000000 },
+  { name: 'Пекин', country: 'Китай', lat: 39.9, lng: 116.4, population: 21500000 },
+  { name: 'Сан-Паулу', country: 'Бразилия', lat: -23.55, lng: -46.63, population: 12300000 },
+  { name: 'Лос-Анджелес', country: 'США', lat: 34.05, lng: -118.24, population: 3900000 },
+  { name: 'Кейптаун', country: 'ЮАР', lat: -33.92, lng: 18.42, population: 4600000 },
+  { name: 'Дубай', country: 'ОАЭ', lat: 25.2, lng: 55.27, population: 3500000 },
+  { name: 'Буэнос-Айрес', country: 'Аргентина', lat: -34.6, lng: -58.38, population: 3100000 }
+];
+
+/* ================= МАТЕМАТИКА СОЛНЦА ================= */
+const rad = d => d * Math.PI / 180;
+const deg = r => r * 180 / Math.PI;
+
+// lat/lng -> вектор. Совпадает с UV SphereGeometry: lng=0 смотрит в +X, север = +Y
+function latLngToVec3(lat, lng, r = 1) {
+  const phi = rad(90 - lat), theta = rad(lng + 180);
+  return new THREE.Vector3(-r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+}
+
+// Направление на Солнце (в системе координат Земли) для времени UTC
+function sunDirection(date) {
+  const startOfYear = Date.UTC(date.getUTCFullYear(), 0, 0);
+  const dayOfYear = Math.floor((date.getTime() - startOfYear) / 86400000);
+  const declination = rad(23.44) * Math.sin(2 * Math.PI * (dayOfYear - 81) / 365);
+  const utcHours = date.getUTCHours() + date.getUTCMinutes() / 60 + date.getUTCSeconds() / 3600 + date.getUTCMilliseconds() / 3.6e6;
+  const hourAngle = rad((utcHours - 12) * 15);
+  // подсолнечная точка: широта = склонение, долгота = -часовой угол
+  return latLngToVec3(deg(declination), deg(-hourAngle), 1);
+}
+
+/* ================= ЗЕМЛЯ (шейдеры) ================= */
+const BASE = 'https://threejs.org/examples/textures/planets/';
+
+const earthVert = `
+varying vec2 vUv; varying vec3 vN; varying vec3 vView;
+void main() {
+  vUv = uv;
+  vN = normalize(mat3(modelMatrix) * normal);
+  vec4 w = modelMatrix * vec4(position, 1.0);
+  vView = cameraPosition - w.xyz;
+  gl_Position = projectionMatrix * viewMatrix * w;
+}`;
+
+const earthFrag = `
+uniform sampler2D dayMap, nightMap, specMap;
+uniform vec3 uSunDir; uniform float uForceDay;
+varying vec2 vUv; varying vec3 vN; varying vec3 vView;
+void main() {
+  vec3 n = normalize(vN);
+  float d = dot(n, uSunDir);
+  float dd = max(d, uForceDay);
+  float light = max(smoothstep(-0.12, 0.2, d), uForceDay);
+  vec3 day = texture2D(dayMap, vUv).rgb;
+  vec3 night = texture2D(nightMap, vUv).rgb;
+  float spec = texture2D(specMap, vUv).r;
+  vec3 dayCol = day * (0.2 + 0.95 * max(dd, 0.0));
+  vec3 r = reflect(-uSunDir, n);
+  dayCol += pow(max(dot(r, normalize(vView)), 0.0), 40.0) * spec * 0.6 * step(0.0, d);
+  dayCol += vec3(1.0, 0.45, 0.15) * exp(-pow(d * 6.0, 2.0)) * 0.18;
+  vec3 nightCol = night * 1.6 + day * 0.025;
+  gl_FragColor = vec4(mix(nightCol, dayCol, light), 1.0);
+  #include <colorspace_fragment>
+}`;
+
+const atmoVert = `
+varying vec3 vN; varying vec3 vWN;
+void main() {
+  vN = normalize(normalMatrix * normal);
+  vWN = normalize(mat3(modelMatrix) * normal);
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+
+const atmoFrag = `
+uniform vec3 uSunDir; varying vec3 vN; varying vec3 vWN;
+void main() {
+  float rim = pow(0.72 - dot(vN, vec3(0.0, 0.0, 1.0)), 3.0);
+  float sunSide = smoothstep(-0.35, 0.4, dot(vWN, uSunDir));
+  gl_FragColor = vec4(vec3(0.25, 0.55, 1.0), 1.0) * clamp(rim, 0.0, 1.0) * (0.15 + 0.85 * sunSide);
+}`;
+
+function createEarth(maxAniso) {
+  const loader = new THREE.TextureLoader();
+  loader.setCrossOrigin('anonymous');
+  const load = (f, srgb = true) => {
+    const t = loader.load(BASE + f);
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.anisotropy = Math.min(8, maxAniso);
+    return t;
+  };
+  const uniforms = {
+    dayMap: { value: load('earth_atmos_2048.jpg') },
+    nightMap: { value: load('earth_lights_2048.png') },
+    specMap: { value: load('earth_specular_2048.jpg', false) },
+    uSunDir: { value: new THREE.Vector3(1, 0, 0) },
+    uForceDay: { value: 0 }
+  };
+  const globe = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 96, 64),
+    new THREE.ShaderMaterial({ uniforms, vertexShader: earthVert, fragmentShader: earthFrag })
+  );
+  const clouds = new THREE.Mesh(
+    new THREE.SphereGeometry(1.012, 64, 48),
+    new THREE.MeshStandardMaterial({ map: load('earth_clouds_1024.png'), transparent: true, depthWrite: false, opacity: 0.85 })
+  );
+  const atmosphere = new THREE.Mesh(
+    new THREE.SphereGeometry(1.07, 64, 48),
+    new THREE.ShaderMaterial({
+      uniforms: { uSunDir: uniforms.uSunDir }, vertexShader: atmoVert, fragmentShader: atmoFrag,
+      side: THREE.BackSide, blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
+    })
+  );
+  return { globe, clouds, atmosphere, uniforms };
+}
+
+/* ================= СЦЕНА ================= */
+const $ = id => document.getElementById(id);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+$('app').appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+Object.assign(labelRenderer.domElement.style, { position: 'fixed', inset: '0', pointerEvents: 'none' });
+document.body.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 200);
+camera.position.set(3.4, 1.2, 2.2);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.minDistance = 1.12;
+controls.maxDistance = 7;
+
+// звёзды
+{
+  const pts = new Float32Array(1800 * 3);
+  for (let i = 0; i < 1800; i++) new THREE.Vector3().randomDirection().multiplyScalar(80).toArray(pts, i * 3);
+  const g = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pts, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 0.15, color: 0xffffff })));
+}
+
+const earth = createEarth(renderer.capabilities.getMaxAnisotropy());
+scene.add(earth.globe, earth.clouds, earth.atmosphere);
+
+const sunLight = new THREE.DirectionalLight(0xfff4e0, 2.6);
+scene.add(sunLight, new THREE.AmbientLight(0x223355, 0.12));
+
+const sun = new THREE.Vector3(1, 0, 0);
+let selected = null;
+
+function updateSun() {
+  const now = new Date();
+  sun.copy(sunDirection(now));
+  earth.uniforms.uSunDir.value.copy(sun);
+  sunLight.position.copy(sun).multiplyScalar(10);
+  $('clock').textContent = now.toISOString().slice(11, 19) + ' UTC';
+  if (selected) renderInfo(selected, now);
+}
+setInterval(updateSun, 1000);
+
+/* ================= ГОРОДА ================= */
+const markers = [];
+const dotGeo = new THREE.SphereGeometry(0.008, 12, 12);
+const dotMat = new THREE.MeshBasicMaterial({ color: 0xffd34d });
+
+for (const city of CITIES) {
+  const normal = latLngToVec3(city.lat, city.lng, 1);
+  const dot = new THREE.Mesh(dotGeo, dotMat);
+  dot.position.copy(normal).multiplyScalar(1.004);
+
+  const el = document.createElement('div');
+  el.className = 'label';
+  el.textContent = city.name;
+  el.addEventListener('click', () => flyTo(city));
+  const label = new CSS2DObject(el);
+  label.position.copy(normal).multiplyScalar(1.01);
+
+  scene.add(dot, label);
+  // чем больше город, тем раньше (с большей дистанции) появляется подпись
+  markers.push({ city, normal, el, threshold: 1.5 + 1.2 * Math.min(city.population / 2e7, 1) });
+}
+
+/* ================= UI ================= */
+for (const c of CITIES) {
+  const b = document.createElement('button');
+  b.textContent = c.name;
+  b.onclick = () => flyTo(c);
+  $('list').appendChild(b);
+}
+
+let forceDay = false;
+$('toggle').onclick = () => {
+  forceDay = !forceDay;
+  earth.uniforms.uForceDay.value = forceDay ? 1 : 0;
+  $('toggle').textContent = forceDay ? '🌙 Всегда день' : '☀ Реальное освещение';
+};
+
+function renderInfo(c, now) {
+  const n = latLngToVec3(c.lat, c.lng, 1);
+  const elev = deg(Math.asin(THREE.MathUtils.clamp(n.dot(sun), -1, 1)));
+  const local = new Date(now.getTime() + (c.lng / 15) * 3.6e6).toISOString().slice(11, 16);
+  const info = $('info');
+  info.hidden = false;
+  info.innerHTML = `<h2>${c.name}</h2>${c.country}<br>` +
+    `Координаты: ${c.lat.toFixed(2)}°, ${c.lng.toFixed(2)}°<br>` +
+    `Население: ${c.population.toLocaleString('ru-RU')}<br>` +
+    `Солнечное время: ${local}<br>` +
+    `Высота Солнца: ${elev.toFixed(1)}° ${elev > 0 ? '☀ день' : '🌙 ночь'}`;
+}
+
+/* ================= ПЕРЕЛЁТ КАМЕРЫ ================= */
+let flight = null;
+function flyTo(c) {
+  selected = c;
+  flight = { dir: latLngToVec3(c.lat, c.lng, 1), dist: 1.45 };
+  renderInfo(c, new Date());
+}
+controls.addEventListener('start', () => { flight = null; });
+
+const tmpQ = new THREE.Quaternion(), idQ = new THREE.Quaternion(), tmpV = new THREE.Vector3();
+function stepFlight(dt) {
+  if (!flight) return;
+  const k = 1 - Math.pow(0.02, dt);
+  const cur = tmpV.copy(camera.position);
+  const len = cur.length();
+  cur.normalize();
+  tmpQ.setFromUnitVectors(cur, flight.dir);
+  const angle = 2 * Math.acos(Math.min(1, Math.abs(tmpQ.w)));
+  camera.position.applyQuaternion(idQ.clone().slerp(tmpQ, k));
+  camera.position.setLength(THREE.MathUtils.lerp(len, flight.dist, k));
+  if (angle < 0.002 && Math.abs(len - flight.dist) < 0.01) flight = null;
+}
+
+/* ================= RESIZE + ЦИКЛ ================= */
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  labelRenderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+updateSun();
+
+const clock = new THREE.Clock();
+const camDir = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  stepFlight(dt);
+  earth.clouds.rotation.y += dt * 0.004;
+
+  const dist = camera.position.length();
+  controls.rotateSpeed = THREE.MathUtils.clamp((dist - 1) * 0.45, 0.12, 1);
+  controls.update();
+
+  camDir.copy(camera.position).normalize();
+  for (const m of markers) {
+    const facing = camDir.dot(m.normal) > 1 / dist + 0.04;
+    const show = facing && (dist < m.threshold || m.city === selected);
+    m.el.style.display = facing ? '' : 'none';
+    m.el.style.opacity = show ? '1' : '0';
+    m.el.style.pointerEvents = show ? 'auto' : 'none';
+  }
+
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
